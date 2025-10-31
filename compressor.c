@@ -10,18 +10,21 @@
 #define PROTECTION_NONE 0
 #define PROTECTION_XOR 1
 
+#define MAX_HUFFMAN_DEPTH 256
+
 const uint8_t SIGNATURE[6] = {0x72, 0x6C, 0x68, 0x66, 0x6D, 0x6E};
 const uint8_t VERSION[2] = {0x01, 0x00};
 const uint8_t NO_CONTEXT_ALG = ALG_RLE;
 const uint8_t CONTEXT_ALG = ALG_HUFFMAN;
 const uint8_t PROTECTION = PROTECTION_XOR;
+const uint8_t XOR_KEY = 0xAB;
 
-typedef struct {
+typedef struct RLE_pair {
   uint8_t L;
   uint8_t c;
 } RLE_pair;
 
-typedef struct {
+typedef struct frequency_pair {
   uint16_t pair;
   unsigned long frequency;
 } frequency_pair;
@@ -34,13 +37,13 @@ typedef struct node_huffman {
   struct node_huffman *right;
 } node_huffman;
 
-typedef struct {
+typedef struct code_huffman {
   uint16_t pair;
   uint8_t *bits;
-  uint8_t length;
+  uint16_t length;
 } code_huffman;
 
-typedef struct {
+typedef struct MinHeap {
   node_huffman **nodes;
   int size;
   int capacity;
@@ -134,20 +137,35 @@ void minheap_heapify(MinHeap *heap, int i) {
 }
 
 void minheap_insert(MinHeap *heap, node_huffman *node) {
-  if (heap->capacity > heap->size) {
-    heap->nodes[heap->size] = node;
-    heap->size++;
-  } else {
+  if (heap->size >= heap->capacity) {
     heap->capacity *= 2;
     heap->nodes = realloc(heap->nodes, heap->capacity * sizeof(node_huffman *));
-    heap->nodes[heap->size] = node;
-    heap->size++;
   }
-  int i = (heap->size) - 1;
-  while (i > 0 &&
-         heap->nodes[parent(i)]->frequency > heap->nodes[i]->frequency) {
-    swap_nodes(&heap->nodes[i], &heap->nodes[parent(i)]);
-    i = parent(i);
+
+  heap->nodes[heap->size] = node;
+  heap->size++;
+
+  int i = heap->size - 1;
+
+  while (i > 0) {
+
+    if (heap->nodes[parent(i)]->frequency > heap->nodes[i]->frequency) {
+      swap_nodes(&heap->nodes[i], &heap->nodes[parent(i)]);
+      i = parent(i);
+    } else if (heap->nodes[parent(i)]->frequency == heap->nodes[i]->frequency) {
+      if (heap->nodes[parent(i)]->pair > heap->nodes[i]->pair) {
+        swap_nodes(&heap->nodes[i], &heap->nodes[parent(i)]);
+        i = parent(i);
+      } else if (heap->nodes[i]->node_type == 0 &&
+                 heap->nodes[parent(i)]->node_type == 1) {
+        swap_nodes(&heap->nodes[i], &heap->nodes[parent(i)]);
+        i = parent(i);
+      } else {
+        break;
+      }
+    } else {
+      break;
+    }
   }
 }
 
@@ -202,6 +220,64 @@ node_huffman *build_huffman_tree(MinHeap *heap) {
     minheap_insert(heap, internal);
   }
   return minheap_extract_min(heap);
+}
+
+// Huffman codes
+uint8_t current_code[(MAX_HUFFMAN_DEPTH + 7) / 8] = {0};
+
+void save_code(code_huffman *code_entry, uint16_t pair, int depth) {
+  code_entry->pair = pair;
+  code_entry->length = depth;
+
+  int bytes_needed = (depth + 7) / 8;
+  code_entry->bits = malloc(bytes_needed);
+  memcpy(code_entry->bits, current_code, bytes_needed);
+}
+
+void set_bit(uint8_t *bit_array, int bit_position, uint8_t value) {
+  int byte_index = bit_position / 8;
+  int bit_index = 7 - (bit_position % 8);
+
+  if (value == 1) {
+    bit_array[byte_index] |= (1 << bit_index);
+  } else {
+    bit_array[byte_index] &= ~(1 << bit_index);
+  }
+}
+
+int find_code_index(code_huffman *code_table, uint16_t pair,
+                    int code_table_size) {
+  for (int i = 0; i < code_table_size; i++) {
+    if (code_table[i].pair == 0 || code_table[i].pair == pair) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+void generate_huffman_codes(node_huffman *root, code_huffman *code_table,
+                            int depth, int code_table_size) {
+  if (root == NULL)
+    return;
+
+  if (root->node_type == 1) {
+    int index = find_code_index(code_table, root->pair, code_table_size);
+    save_code(&code_table[index], root->pair, depth);
+    return;
+  }
+
+  set_bit(current_code, depth, 1);
+  generate_huffman_codes(root->right, code_table, depth + 1, code_table_size);
+
+  set_bit(current_code, depth, 0);
+  generate_huffman_codes(root->left, code_table, depth + 1, code_table_size);
+}
+
+// XOR protection
+void apply_xor_protection(uint8_t *data, size_t size, uint8_t key) {
+  for (size_t i = 0; i < size; i++) {
+    data[i] ^= key;
+  }
 }
 
 // Only RLE encoding implemented
@@ -271,10 +347,63 @@ void encode_file(const char *input_path, const char *output_path) {
     }
   }
 
-  free(rle_encode);
+  MinHeap *heap = create_minheap(frequency_size);
 
-  qsort(frequency_table, frequency_size, sizeof(frequency_pair),
-        compare_frequency);
+  for (int i = 0; i < frequency_size; i++) {
+    minheap_insert(heap, create_leaf_node(frequency_table[i].pair,
+                                          frequency_table[i].frequency));
+  }
+
+  node_huffman *root = build_huffman_tree(heap);
+
+  int depth = 0;
+
+  code_huffman *code_table = malloc(sizeof(code_huffman) * frequency_size);
+  generate_huffman_codes(root, code_table, depth, frequency_size);
+
+  uint8_t bit_buffer = 0;
+  int bit_count = 0;
+  int main_buffer_size = 0;
+  int main_buffer_capacity = 256;
+  uint8_t *main_buffer = malloc(main_buffer_capacity);
+
+  for (int i = 0; i < rle_size; i++) {
+
+    uint16_t current_pair = (rle_encode[i].L << 8) | rle_encode[i].c;
+    int code_index = find_code_index(code_table, current_pair, frequency_size);
+    code_huffman *code = &code_table[code_index];
+
+    for (int bit_pos = 0; bit_pos < code->length; bit_pos++) {
+      int byte_index = bit_pos / 8;
+      int bit_index = 7 - (bit_pos % 8);
+      int bit = (code->bits[byte_index] >> bit_index) & 1;
+
+      bit_buffer = (bit_buffer << 1) | bit;
+      bit_count++;
+
+      if (bit_count == 8) {
+        if (main_buffer_size >= main_buffer_capacity) {
+          main_buffer_capacity *= 2;
+          main_buffer = realloc(main_buffer, main_buffer_capacity);
+        }
+
+        main_buffer[main_buffer_size++] = bit_buffer;
+        bit_buffer = 0;
+        bit_count = 0;
+      }
+    }
+  }
+
+  if (bit_count > 0) {
+    bit_buffer <<= (8 - bit_count);
+    if (main_buffer_size >= main_buffer_capacity) {
+      main_buffer_capacity++;
+      main_buffer = realloc(main_buffer, main_buffer_capacity);
+    }
+    main_buffer[main_buffer_size++] = bit_buffer;
+  }
+
+  apply_xor_protection(main_buffer, main_buffer_size, XOR_KEY);
 
   fwrite(SIGNATURE, sizeof(uint8_t), 6, fw);
   fwrite(VERSION, sizeof(uint8_t), 2, fw);
@@ -282,6 +411,24 @@ void encode_file(const char *input_path, const char *output_path) {
   fwrite(&NO_CONTEXT_ALG, sizeof(uint8_t), 1, fw);
   fwrite(&CONTEXT_ALG, sizeof(uint8_t), 1, fw);
   fwrite(&PROTECTION, sizeof(uint8_t), 1, fw);
+  fwrite(&XOR_KEY, sizeof(uint8_t), 1, fw);
+  fwrite(&main_buffer_size, sizeof(uint32_t), 1, fw);
+
+  fwrite(main_buffer, sizeof(uint8_t), main_buffer_size, fw);
+
+  free(rle_encode);
+  free(frequency_table);
+  destroy_minheap(heap);
+  free(root);
+
+  for (int i = 0; i < frequency_size; i++) {
+    if (code_table[i].bits != NULL) {
+      free(code_table[i].bits);
+    }
+  }
+  free(code_table);
+
+  free(main_buffer);
 
   fclose(fr);
   fclose(fw);
@@ -323,7 +470,7 @@ void decode_file(const char *input_path, const char *output_path) {
 
 int main() {
 #if 1
-  encode_file("Q.txt", "code.otik");
+  encode_file("test.txt", "code.rlhfmn");
 #endif
 
 #if 0
