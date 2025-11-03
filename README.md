@@ -13,6 +13,6 @@ cd rle-huffman-compressor
 # Build
 make
 
-# Run (for compress test.txt file)
+# Run (to compress test.txt file)
 ./compressor
 ```
