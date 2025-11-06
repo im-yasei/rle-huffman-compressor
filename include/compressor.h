@@ -55,6 +55,10 @@ node_huffman *minheap_extract_min(MinHeap *heap);
 node_huffman *create_leaf_node(uint16_t pair, unsigned long frequency);
 node_huffman *create_internal_node(node_huffman *left, node_huffman *right);
 node_huffman *build_huffman_tree(MinHeap *heap);
+uint16_t decode_symbol(node_huffman *root, uint8_t *buffer, int size,
+                       int *current_byte, uint8_t *current_bit,
+                       uint8_t last_byte_bits);
+void destroy_huffman_tree(node_huffman *root);
 
 // Huffman code
 void generate_huffman_codes(node_huffman *root, code_huffman *code_table,
@@ -65,6 +69,8 @@ int find_code_index(code_huffman *code_table, uint16_t pair,
 // utils
 void set_bit(uint8_t *bit_array, int bit_position, uint8_t value);
 void apply_xor_protection(uint8_t *data, int size, uint8_t key);
+uint8_t read_bit_from_buffer(uint8_t *buffer, int size, int *current_byte,
+                             uint8_t *current_bit);
 
 // encode/decode
 void encode_file(const char *input_path, const char *output_path);

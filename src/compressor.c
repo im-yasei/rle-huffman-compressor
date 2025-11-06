@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 void encode_file(const char *input_path, const char *output_path) {
 
@@ -85,9 +86,9 @@ void encode_file(const char *input_path, const char *output_path) {
   code_huffman *code_table = malloc(sizeof(code_huffman) * frequency_size);
   generate_huffman_codes(root, code_table, depth, frequency_size);
 
-  uint8_t bit_buffer = 0;
+  uint8_t bit_buffer = 0, last_byte_bits;
   int bit_count = 0;
-  int main_buffer_size = 0;
+  uint32_t main_buffer_size = 0;
   int main_buffer_capacity = 256;
   uint8_t *main_buffer = malloc(main_buffer_capacity);
 
@@ -127,6 +128,8 @@ void encode_file(const char *input_path, const char *output_path) {
     main_buffer[main_buffer_size++] = bit_buffer;
   }
 
+  last_byte_bits = bit_count;
+
   apply_xor_protection(main_buffer, main_buffer_size, xor_key);
 
   fwrite(SIGNATURE, sizeof(uint8_t), 6, fw);
@@ -138,35 +141,32 @@ void encode_file(const char *input_path, const char *output_path) {
   fwrite(&frequency_size, sizeof(int), 1, fw);
 
   for (int i = 0; i < frequency_size; i++) {
-    fwrite(&code_table[i].pair, sizeof(uint16_t), 1, fw);
-    fwrite(&code_table[i].length, sizeof(uint16_t), 1, fw);
-    fwrite(code_table[i].bits, sizeof(uint8_t), (code_table[i].length + 7) / 8,
-           fw);
+    fwrite(&frequency_table[i].pair, sizeof(uint16_t), 1, fw);
+    fwrite(&frequency_table[i].frequency, sizeof(unsigned long), 1, fw);
   }
 
+  fwrite(&last_byte_bits, sizeof(uint8_t), 1, fw);
   fwrite(&main_buffer_size, sizeof(uint32_t), 1, fw);
   fwrite(main_buffer, sizeof(uint8_t), main_buffer_size, fw);
 
   free(rle_encode);
   free(frequency_table);
   destroy_minheap(heap);
-  free(root);
+  destroy_huffman_tree(root);
 
   for (int i = 0; i < frequency_size; i++) {
     if (code_table[i].bits != NULL) {
       free(code_table[i].bits);
     }
   }
-  free(code_table);
 
+  free(code_table);
   free(main_buffer);
 
   fclose(fr);
   fclose(fw);
 }
 
-// Temporary implementation: only reads file signature and compressed data
-// TODO: Add full Huffman and RLE decoding
 void decode_file(const char *input_path, const char *output_path) {
   FILE *fr = fopen(input_path, "rb");
   FILE *fw = fopen(output_path, "wb");
@@ -177,10 +177,14 @@ void decode_file(const char *input_path, const char *output_path) {
   uint8_t context_alg;
   uint8_t protection;
   uint8_t xor_key = 0xAB;
+  uint8_t last_byte_bits;
+  uint64_t file_size;
+  uint32_t main_buffer_size = 0;
 
-  int file_size, frequency_size, main_buffer_size, total_read = 0;
+  int frequency_size, total_read = 0;
+  int decoded_count = 0;
+  unsigned long rle_size = 0;
 
-  code_huffman *code_table = NULL;
   uint8_t *main_buffer = NULL;
 
   fread(read_signature, sizeof(uint8_t), 6, fr);
@@ -188,57 +192,131 @@ void decode_file(const char *input_path, const char *output_path) {
   fread(&no_context_alg, sizeof(uint8_t), 1, fr);
   fread(&context_alg, sizeof(uint8_t), 1, fr);
   fread(&protection, sizeof(uint8_t), 1, fr);
-  fread(&file_size, sizeof(int), 1, fr);
+  fread(&file_size, sizeof(uint64_t), 1, fr);
   fread(&frequency_size, sizeof(int), 1, fr);
 
-  code_table = malloc(frequency_size * sizeof(code_huffman));
+  frequency_pair *frequency_table =
+      malloc(frequency_size * sizeof(frequency_pair));
 
   for (int i = 0; i < frequency_size; i++) {
-    fread(&code_table[i].pair, sizeof(uint16_t), 1, fr);
-    fread(&code_table[i].length, sizeof(uint16_t), 1, fr);
-    fread(code_table[i].bits, sizeof(uint8_t), (code_table[i].length + 7) / 8,
-          fr);
+    fread(&frequency_table[i].pair, sizeof(uint16_t), 1, fr);
+    fread(&frequency_table[i].frequency, sizeof(unsigned long), 1, fr);
   }
 
-  fread(&main_buffer_size, sizeof(int), 1, fr);
+  fread(&last_byte_bits, sizeof(uint8_t), 1, fr);
+
+  fread(&main_buffer_size, sizeof(uint32_t), 1, fr);
 
   main_buffer = malloc(main_buffer_size * sizeof(uint8_t));
 
   fread(main_buffer, sizeof(uint8_t), main_buffer_size, fr);
 
-#if 0
-  uint8_t *buffer = malloc(sizeof(uint8_t) * 8);
-  uint16_t *rle_pairs_buffer = NULL;
+  apply_xor_protection(main_buffer, main_buffer_size, xor_key);
 
-  for (int i = 0; i < 256; i++) {
+  // Decoding wiht Huffman tree
+  MinHeap *heap = create_minheap(frequency_size);
+
+  for (int i = 0; i < frequency_size; i++) {
+    minheap_insert(heap, create_leaf_node(frequency_table[i].pair,
+                                          frequency_table[i].frequency));
+    rle_size += frequency_table[i].frequency;
   }
 
-  if ((memcmp(read_signature, SIGNATURE, 6) != 0) ||
-      (memcmp(read_version, VERSION, 2) != 0)) {
-    printf("error\n");
+  node_huffman *root = build_huffman_tree(heap);
+
+  RLE_pair *rle_file = malloc(rle_size * sizeof(RLE_pair));
+
+  int current_byte = 0;
+  uint8_t current_bit = 0;
+
+  while (decoded_count < rle_size) {
+    uint16_t pair = decode_symbol(root, main_buffer, main_buffer_size,
+                                  &current_byte, &current_bit, last_byte_bits);
+
+    if (pair == 0 && current_byte >= main_buffer_size) {
+      break;
+    }
+
+    rle_file[decoded_count].L = pair >> 8;
+    rle_file[decoded_count].c = pair & 0xFF;
+
+    decoded_count++;
   }
 
-  // uint8_t buffer[4096];
-  size_t bytes_read;
+  destroy_minheap(heap);
+  destroy_huffman_tree(root);
 
-  while (total_read < file_size &&
-         (bytes_read = fread(buffer, 1, sizeof(buffer), fr)) > 0) {
-    fwrite(buffer, 1, bytes_read, fw);
-    total_read += bytes_read;
+  for (int i = 0; i < rle_size; i++) {
+    for (int j = 0; j < rle_file[i].L; j++) {
+      fwrite(&rle_file[i].c, sizeof(uint8_t), 1, fw);
+    }
   }
+
+  free(frequency_table);
+  free(main_buffer);
+  free(rle_file);
 
   fclose(fr);
   fclose(fw);
-#endif
+
+  FILE *fr_test = fopen(output_path, "rb");
+
+  fseek(fr_test, 0, SEEK_END);
+  uint64_t decoded_file_size = ftell(fr_test);
+  fseek(fr_test, 0, SEEK_SET);
+
+  if (file_size == decoded_file_size) {
+    printf("✓ OK (Source file size = Decompressed file size = %lu bytes)\n",
+           file_size);
+  } else {
+    printf("✗ FAIL Source file size = %lu bytes\n       Decompressed file "
+           "size = "
+           "%lu bytes\n",
+           file_size, decoded_file_size);
+  }
+
+  fclose(fr_test);
 }
 
-int main() {
-#if 1
-  encode_file("test.txt", "code.rlhfmn");
-#endif
+int main(int argc, char *argv[]) {
 
-#if 0
-  decode_file("code.rlhfmn", "decode.txt");
-#endif
+  int encode_mode = 0;
+  int decode_mode = 0;
+  int opt;
+
+  while ((opt = getopt(argc, argv, "cdh")) != -1) {
+    switch (opt) {
+    case 'c':
+      encode_mode = 1;
+      break;
+    case 'd':
+      decode_mode = 1;
+      break;
+    case 'h':
+      printf("Usage:\n");
+      printf("  %s -c input_file output_file\n", argv[0]);
+      printf("  %s -d input_file output_file\n", argv[0]);
+      return 0;
+    default:
+      return 1;
+    }
+  }
+
+  if (((encode_mode == 1) || (decode_mode == 1)) && optind + 2 == argc) {
+    const char *input_file = argv[optind];
+    const char *output_file = argv[optind + 1];
+
+    if (encode_mode) {
+      encode_file(input_file, output_file);
+      printf("Compressed: %s -> %s\n", input_file, output_file);
+    } else {
+      decode_file(input_file, output_file);
+      printf("Decompressed: %s -> %s\n", input_file, output_file);
+    }
+  } else {
+    printf("Error: Use %s -c input output OR %s -d input output\n", argv[0],
+           argv[0]);
+    return 1;
+  }
   return 0;
 }
