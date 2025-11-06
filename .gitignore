@@ -1,7 +1,8 @@
 compressor
 /obj/
 *.rlhfmn
-*.txt
+/test_files/
 *.jpg
+*.txt
 *.o
 *.out
