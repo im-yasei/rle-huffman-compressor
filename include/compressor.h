@@ -69,8 +69,6 @@ int find_code_index(code_huffman *code_table, uint16_t pair,
 // utils
 void set_bit(uint8_t *bit_array, int bit_position, uint8_t value);
 void apply_xor_protection(uint8_t *data, int size, uint8_t key);
-uint8_t read_bit_from_buffer(uint8_t *buffer, int size, int *current_byte,
-                             uint8_t *current_bit);
 
 // encode/decode
 void encode_file(const char *input_path, const char *output_path);
